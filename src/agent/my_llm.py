@@ -11,12 +11,14 @@ llm = ChatOpenAI(
 )
 
 # deepseek大模型
+# deepseek大模型
 # llm = ChatOpenAI(
 #     model='deepseek-chat',
 #     temperature=0.8,
-#     api_key='sk-YBLKX7wJEJ8wuFUWGujP8Iw13GneZhEZDCVaz6Rivv9ps9wy',
-#     base_url='https://xiaoai.plus/v1'
+#     api_key=OPENAI_API_KEY,
+#     base_url=OPENAI_BASE_URL
 # )
+
 
 #  claude 的大模型调用
 # llm = ChatOpenAI(
