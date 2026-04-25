@@ -1,11 +1,13 @@
 import asyncio
 import json
 from typing import Dict, Any, List
-
+import gradio as gr
 from langchain_core.messages import ToolMessage, AIMessage, ToolCall
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.constants import END, START
 from langgraph.graph import MessagesState, StateGraph
+from langgraph.types import interrupt, Command
 
 from agent.env_utils import ZHIPU_API_KEY
 from agent.my_llm import llm
@@ -45,6 +47,7 @@ class BasicToolsNode:
     2. 并发执行消息中的工具调用请求
     3. 自动处理同步/异步工具适配
     """
+
     def __init__(self, tools: list):
         """初始化工具节点
         Args:
@@ -66,10 +69,26 @@ class BasicToolsNode:
             raise ValueError("输入数据中未找到消息内容")  # 改进后的中文错误提示
         message: AIMessage = messages[-1]  # 取最新消息: AIMessage
 
+        tool_name = message.tool_calls[0]["name"] if message.tool_calls else None
+        if tool_name == 'webSearchStd' or tool_name == 'webSearchSogou':
+            response = interrupt(
+                f"AI大模型尝试调用工具 `{tool_name}`，\n"
+                "请审核并选择：批准（y）或直接给我工具执行的答案。"
+            )
+            # response(字典): 由人工输入的：批准(y),工具执行的答案或者拒绝执行工具的理由
+            # 根据人工响应类型处理
+            if response["answer"] == "y":
+                pass  # 直接使用原参数继续执行
+            else:
+                return {"messages": [ToolMessage(
+                    content=f"人工终止了该工具的调用，给出的理由或者答案是:{response['answer']}",
+                    name=tool_name,
+                    tool_call_id=message.tool_calls[0]['id'],
+                )]}
+
         # 2. 并发执行工具调用
         outputs = await self._execute_tool_calls(message.tool_calls)
         return {"messages": outputs}
-
 
     async def _execute_tool_calls(self, tool_calls: list[Dict]) -> List[ToolMessage]:
         """执行实际工具调用
@@ -122,7 +141,7 @@ class BasicToolsNode:
             # 结果收集：按输入顺序返回所有协程的结果（或异常），与任务完成顺序无关。
             # 异常处理：默认情况下，任一任务失败会立即取消其他任务并抛出异常；若设置 return_exceptions=True，则异常会作为结果返回。
             #
-            return await asyncio.gather( *[_invoke_tool(tool_call) for tool_call in tool_calls])
+            return await asyncio.gather(*[_invoke_tool(tool_call) for tool_call in tool_calls])
         except Exception as e:
             print(e)
             raise RuntimeError("并发执行工具时发生错误") from e
@@ -130,6 +149,7 @@ class BasicToolsNode:
 
 class State(MessagesState):
     pass
+
 
 def route_tools_func(state: State):
     """
@@ -146,7 +166,6 @@ def route_tools_func(state: State):
     return END
 
 
-
 async def create_graph():
     tools = await mcp_client.get_tools()  # 30个以上的工具，全部来自MCP服务端
 
@@ -155,8 +174,7 @@ async def create_graph():
     llm_with_tools = llm.bind_tools(tools)
 
     async def chatbot(state: State):
-        return {'messages': [ await llm_with_tools.ainvoke(state["messages"])]}
-
+        return {'messages': [await llm_with_tools.ainvoke(state["messages"])]}
 
     builder.add_node('chatbot', chatbot)
 
@@ -170,8 +188,114 @@ async def create_graph():
     )
     builder.add_edge('tools', 'chatbot')
     builder.add_edge(START, 'chatbot')
-    graph = builder.compile()
+    memory = MemorySaver()
+    graph = builder.compile(checkpointer=memory)
     return graph
 
 
-agent = asyncio.run(create_graph())
+graph = asyncio.run(create_graph())
+ # 配置参数，包含乘客ID和线程ID
+config = {
+    "configurable": {
+        # 检查点由session_id访问
+        "thread_id": 'zs12311',
+    }
+}
+
+
+def add_message(chat_history, user_message):
+    """
+    向聊天历史记录中添加用户消息
+
+    参数:
+        chat_history (list): 聊天历史记录列表，包含角色和内容的字典
+        user_message (str): 用户输入的消息内容
+
+    返回:
+        tuple: 包含更新后的聊天历史记录和一个不可交互的文本框组件
+    """
+    # 如果用户消息不为空，则将其添加到聊天历史记录中
+    if user_message:
+        chat_history.append({"role": "user", "content": user_message})
+
+    # 返回更新后的聊天历史记录和一个清空且不可交互的文本框
+    return chat_history, gr.Textbox(value=None, interactive=False)
+
+
+def print_message(event, result):
+    """格式化输出消息"""
+    messages = event.get('messages')
+    if messages:
+        if isinstance(messages, list):
+            message = messages[-1]  # 如果消息是列表，则取最后一个
+        if message.__class__.__name__ == 'AIMessage':
+            if message.content:
+                # print(result)
+                result = message.content  # 需要在展示的消息
+        msg_repr = message.pretty_repr(html=True)
+        if len(msg_repr) > 1500:
+            msg_repr = msg_repr[:1500] + " ... （已截断）"  # 超过最大长度则截断
+        print(msg_repr)  # 输出消息的表示形式
+    return result
+
+async def submit_messages(chat_history):
+    """ 执行工作流的函数"""
+    user_input = chat_history[-1]['content']
+    result = ''  # AI助手的最后一条消息
+    current_state = graph.get_state(config)
+    if current_state.next:  # 出现了工作流的中断
+        human_command = Command(resume={'answer': user_input})
+        async for chunk in graph.astream(human_command, config, stream_mode='values'):
+            result = print_message(chunk, result)
+            chat_history.append({'role': 'assistant', 'content': result})
+        return chat_history
+    else:
+        async for chunk in graph.astream({'messages': ('user', user_input)}, config, stream_mode='values'):
+            result = print_message(chunk, result)
+
+    current_state = graph.get_state(config)
+    if current_state.next:  # 出现了工作流的中断
+        result = current_state.interrupts[0].value
+
+    chat_history.append({'role': 'assistant', 'content': result})
+    return chat_history
+
+# 开发一个聊天机器人的Web界面
+with gr.Blocks(title='我的智能小秘书', theme=gr.themes.Soft()) as block:
+
+    # 聊天历史记录的组件
+    chatbot = gr.Chatbot(type='messages', height=500, label='AI机器人')
+    chat_input = gr.Textbox(placeholder='请给你的秘书发送消息...', label='文字输入', max_lines=5)
+
+    submit_btn = gr.Button('发送', variant="primary")
+
+    chat_input.submit(
+        add_message,
+        [chatbot, chat_input],
+        [chatbot, chat_input]
+    ).then(
+        submit_messages,
+        [chatbot],
+        [chatbot],
+    ).then(  # 回复完成后重新激活输入框
+        lambda: gr.Textbox(interactive=True),  # 匿名函数重置输入框
+        None,  # 无输入
+        [chat_input]  # 输出到输入框
+    )
+
+    submit_btn.click(
+        add_message,
+        [chatbot, chat_input],
+        [chatbot, chat_input]
+    ).then(
+        submit_messages,
+        [chatbot],
+        [chatbot],
+    ).then(  # 回复完成后重新激活输入框
+        lambda: gr.Textbox(interactive=True),  # 匿名函数重置输入框
+        None,  # 无输入
+        [chat_input]  # 输出到输入框
+    )
+if __name__ == '__main__':
+    # asyncio.run(run_graph())
+    block.launch()
